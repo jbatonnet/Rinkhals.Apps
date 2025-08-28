@@ -1,0 +1,978 @@
+diff --git a/klippy/extras/cs1237.py b/klippy/extras/cs1237.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..0de344e0f4f1f6e7511b4a5538cb2fb5cec41246
+--- /dev/null
++++ b/klippy/extras/cs1237.py
+@@ -0,0 +1,457 @@
++# CS1237 support 
++#
++# Copyright (C) 2025 Antiriad <mail.antiriad@gmail.com>
++#
++# This file may be distributed under the terms of the GNU GPLv3 license.
++
++import logging
++import ctypes
++
++
++# State and error constants
++SELF_CHECK_STATE      = 1 << 0
++SCRATCH_STATE         = 1 << 1
++BLOCK_FILAMENT_STATE  = 1 << 2
++HEAD_BLOCK_STATE      = 1 << 3
++SELF_CHECK_ERR        = SELF_CHECK_STATE      | 0x80
++SCRATCH_STATE_ERR     = SCRATCH_STATE         | 0x80
++BLOCK_FILAMENT_ERR    = BLOCK_FILAMENT_STATE  | 0x80
++HEAD_BLOCK_STATE_ERR  = HEAD_BLOCK_STATE      | 0x80
++
++
++class CS1237:
++    head_block_sensitivity     = 0
++    scratch_sensitivity        = 0
++    self_check_sensitivity     = 0
++    block_filament_sensitivity = 0
++    
++    def __init__(self, config):
++        # Core references
++        self.BLOCK_FILAMENT_STATE = BLOCK_FILAMENT_STATE
++        self.SCRATCH_STATE = SCRATCH_STATE
++        self.SELF_CHECK_STATE = SELF_CHECK_STATE
++        self.HEAD_BLOCK_STATE = HEAD_BLOCK_STATE
++        
++        self.printer = config.get_printer()
++        self.mcu = config.get_printer().lookup_object('mcu nozzle_mcu')
++        ppins       = self.printer.lookup_object('pins')
++
++        # Configuration parameters
++        self.level_pin_name      = config.get('level_pin', None)
++        self.dout_pin_name       = config.get('dout_pin')
++        self.sclk_pin_name       = config.get('sclk_pin')
++        self.register_address    = config.getint('register', default=60)
++        self.sensitivity         = config.getint('sensitivity', default=-2500)
++        self._samples_per_second = config.getint('samples_per_second', default=10)
++        self._range              = (-0x800000, 0x7FFFFF)
++
++        # Threshold sensitivities
++        self.head_block_sensitivity = config.getint('head_block_sensitivity', default=-300000)
++        self.scratch_sensitivity = config.getint('scratch_sensitivity', default=-100000)  
++        self.self_check_sensitivity = config.getint('self_check_sensitivity', default=-400)
++        self.block_filament_sensitivity = config.getint('block_filament_sensitivity', default=-3000)
++
++        # Resolve pin numbers
++        def _get_pin(name):
++            return ppins.lookup_pin(name, True, True, None)['pin']
++
++        self.level_pin = _get_pin(self.level_pin_name) if self.level_pin_name else 0
++        self.dout_pin  = _get_pin(self.dout_pin_name)
++        self.sclk_pin  = _get_pin(self.sclk_pin_name)
++
++        # State variables
++        self.adc_value       = None
++        self.raw_value       = None
++        self.sensor_state    = None
++        self.checkself_flag  = None
++        self._clients        = []
++        self._reporting      = False
++        self._query_complete = None
++
++        # Register config callback for MCU command setup
++        self.mcu.register_config_callback(self._build_config)
++
++        # Register G-code commands
++        gcode = self.printer.lookup_object('gcode')
++        gcode.register_command('CS1237',       self.cmd_dump, when_not_ready=False, desc='')
++        gcode.register_command('G9121',       self.cmd_g9121, False, '')
++        gcode.register_command('G9122',       self.cmd_g9122, False, '')
++        gcode.register_command('G9123',       self.cmd_g9123, False, '')
++        gcode.register_command('CS1237_DUMP', self.cmd_dump, False, 'debug CS1237 DUMP')
++
++        # Dedicated MCU test commands
++        gcode.register_command('CS1237_CHECKSELF', self.cmd_checkself_cs1237, False, 'Trigger checkself_cs1237 MCU command')
++        gcode.register_command('CS1237_CONFIG', self.cmd_config_cs1237, False, 'Trigger config_cs1237 MCU command')
++        gcode.register_command('CS1237_RESET', self.cmd_reset_cs1237, False, 'Trigger reset_cs1237 MCU command')
++        gcode.register_command('CS1237_REPORT', self.cmd_start_cs1237_report, False, 'Trigger start_cs1237_report MCU command')
++        gcode.register_command('CS1237_DIFF', self.cmd_query_cs1237_diff, False, 'Trigger query_cs1237_diff MCU command')
++        gcode.register_command('CS1237_ENABLE', self.cmd_enable_cs1237, False, 'Trigger enable_cs1237 MCU command')
++        
++        # Register event handlers
++        self.printer.register_event_handler('project:ready', self._handle_ready)
++        self.printer.register_event_handler('klippy:ready', self._on_ready_enable)
++    
++    def _on_ready_enable(self, *a, **k):
++        try:
++            self._cmd_reset.send([self._oid, 1])
++        except Exception:
++            pass
++        self._enable_cs1237(1)
++        try:
++            ticks = self.mcu.seconds_to_clock(0.10)
++            self.cmd_start_report.send([
++                self._oid,
++                1,
++                ticks,
++                0,              
++                self.sensitivity
++            ])
++        except Exception:
++            logging.exception("CS1237: failed to prime comparator")
++        try:
++            self.cmd_start_report.send([self._oid, 0, 0, 0, 0])
++        except Exception:
++            pass
++
++        
++    def _handle_ready(self, *args):
++        params = None
++        try:
++            self._cmd_reset.send([self._oid, 3])
++
++            reactor = self.printer.get_reactor()
++            reactor.pause(reactor.monotonic() + 0.1)
++
++            self._enable_cs1237(1)
++            self._query_complete = reactor.completion()
++            self.cmd_checkself.send([self._oid, 0])
++
++            params = self._query_complete.wait(reactor.monotonic() + 2.0)
++        except Exception:
++            logging.exception("CS1237: Error in _handle_ready")
++        finally:
++            self._enable_cs1237(0)
++            self._query_complete = None
++
++        if params is not None:
++            state = int(params.get('flag', 0))
++            if state == 0:
++                self.printer.invoke_shutdown("cs1237 boot up checkself failed")
++
++    def cmd_enable_cs1237(self, gcmd):
++        state = gcmd.get_int('STATE', 1, minval=0, maxval=1)
++        self._enable_cs1237(state)
++
++    def _enable_cs1237(self, state=1):
++        self._cmd_enable.send([self._oid, state])
++        logging.info(f"[CS1237] _enable_cs1237 called. STATE={state}")
++    
++    # Dedicated G-code command handlers for MCU commands
++    def cmd_checkself_cs1237(self, gcmd):
++        w = gcmd.get_int('W', 0, minval=0, maxval=3)
++        self.cmd_checkself.send([
++            self._oid,
++            w
++        ])
++        logging.info(f"[CS1237] Sent checkself_cs1237 with W={w}")
++    def cmd_config_cs1237(self, gcmd):
++        cfg = (
++            f"config_cs1237 oid={self._oid} "
++            f"level_pin={self.level_pin} dout_pin={self.dout_pin} sclk_pin={self.sclk_pin} "
++            f"register={self.register_address} sensitivity={self.sensitivity}"
++        )
++        self.mcu.add_config_cmd(cfg)
++
++    def cmd_reset_cs1237(self, gcmd):
++        count = gcmd.get_int('COUNT', 3, minval=1, maxval=10)
++        self._cmd_reset.send([
++            self._oid,
++            count
++        ])
++
++    def cmd_start_cs1237_report(self, gcmd):
++        ticks = gcmd.get_int('TICKS', self.mcu.seconds_to_clock(1.0 / self._samples_per_second))
++        print_state = gcmd.get_int('STATE', 0, minval=0, maxval=3)
++        sensitivity = gcmd.get_int('SENS', self.sensitivity)
++        self.cmd_start_report.send([
++            self._oid,
++            1,
++            ticks,
++            print_state,
++            sensitivity
++        ])
++
++    def cmd_query_cs1237_diff(self, gcmd):
++        diff_cmd = self.mcu.lookup_command("query_cs1237_diff oid=%c")
++        diff_cmd.send([
++            self._oid
++        ])
++        self.printer.register_event_handler('cs1237:self_check', self._self_check_sequence)
++
++    def _build_config(self):
++        self._oid = self.mcu.create_oid()
++        cfg = (
++            f"config_cs1237 oid={self._oid} "
++            f"level_pin={self.level_pin} dout_pin={self.dout_pin} sclk_pin={self.sclk_pin} "
++            f"register={self.register_address} sensitivity={self.sensitivity}"
++        )
++
++        self.mcu.add_config_cmd(cfg)
++        self.cmd_start_report = self.mcu.lookup_command(
++            "start_cs1237_report oid=%c enable=%c ticks=%i print_state=%c sensitivity=%i"
++        )
++        self.cmd_checkself = self.mcu.lookup_command(
++            "checkself_cs1237 oid=%c write=%c"
++        )
++        self._cmd_enable = self.mcu.lookup_command("enable_cs1237 oid=%c state=%c")
++        self._cmd_reset  = self.mcu.lookup_command("reset_cs1237 oid=%c count=%c")
++
++        self.mcu.register_response(self._handle_cs1237_report,  'cs1237_state', self._oid)
++        self.mcu.register_response(self._handle_cs1237_diff,    'cs1237_diff', self._oid)
++        self.mcu.register_response(self._handle_cs1237_check,   'cs1237_checkself_flag', self._oid)
++
++    def _handle_start_report_ack(self, params):
++        logging.info(f"[CS1237] start_cs1237_report ACK received: {params}")
++
++    def _handle_checkself_ack(self, params):
++        logging.info(f"[CS1237] checkself_cs1237 ACK received: {params}")
++
++    # ---- MCU Response Handlers ----
++    def _int32_conversion(self, value):
++        return ctypes.c_int32(value).value
++
++    def _handle_cs1237_report(self, params):
++        try:
++            self.adc_value = self._int32_conversion(int(params.get('adc', 0)))
++            self.raw_value = self._int32_conversion(int(params.get('raw', 0)))
++            self.sensor_state = int(params.get('state', 0))
++            logging.info(f"[CS1237 REPORT] adc={self.adc_value} raw={self.raw_value} state={self.sensor_state}")
++
++            msg = {
++                'timestamp': self.printer.get_reactor().monotonic(),
++                'adc': self.adc_value,
++                'raw': self.raw_value,
++                'state': self.sensor_state
++            }
++            
++            # Process sensor state events
++            if self.sensor_state == SCRATCH_STATE_ERR:
++                logging.info("CS1237: SCRATCH_STATE_ERR detected")
++                self.printer.send_event("CS1237:scratch_notice", None)
++            elif self.sensor_state == BLOCK_FILAMENT_ERR:
++                logging.info("CS1237: BLOCK_FILAMENT_ERR detected")
++                self.printer.send_event("CS1237:block_filament_notice", None)
++            elif self.sensor_state == HEAD_BLOCK_STATE_ERR:
++                logging.info("CS1237: HEAD_BLOCK_STATE_ERR detected")
++                self.printer.send_event("CS1237:head_block_notice", None)
++                
++            # Notify clients
++            for cb in list(self._clients):
++                if cb(msg) is False:
++                    self._clients.remove(cb)
++        except Exception:
++            logging.exception("CS1237: report handler error")
++
++    def _handle_cs1237_diff(self, params):
++        try:
++            self.raw_value = int(params.get('raw', 0))
++            if self._query_complete:
++                self._query_complete.complete(params)
++        except Exception:
++            logging.exception("CS1237: diff handler error")
++
++
++    def _handle_cs1237_check(self, params):
++        try:
++            self.checkself_flag = int(params.get('flag', 0))
++            if self._query_complete:
++                self._query_complete.complete(params)
++        except Exception:
++            logging.exception("CS1237: self-check handler error")
++
++
++    # ---- Status ----
++    def get_status(self, eventtime=None):
++        if not self._reporting:
++            return {}
++        
++        # Return status data when reporting is enabled
++        return {
++            'adc': self.adc_value,
++            'raw': self.raw_value,
++            'state': self.sensor_state,
++            'checkself_flag': self.checkself_flag
++        }
++    
++    def stats(self, eventtime):
++        return False, f"cs1237:adc_value={self.adc_value} raw_value={self.raw_value} sensor_state={self.sensor_state}"
++
++    # ---- Reporting Control ----
++    def start_reporting(self):
++        if self._reporting:
++            return
++        self._reporting = True
++        ticks = self.mcu.seconds_to_clock(1.0 / self._samples_per_second)
++        self.cmd_start_report.send([
++            self._oid,
++            1,
++            ticks,
++            0,
++            self.sensitivity
++        ])
++    
++    def stop_reporting(self):
++        if not self._reporting:
++            return
++        self._reporting = False
++        self.cmd_start_report.send([
++            self._oid,
++            0,
++            0,
++            0,
++            self.sensitivity
++        ])
++
++    def add_client(self, callback):
++        if callback not in self._clients:
++            self._clients.append(callback)
++        self.start_reporting()
++
++    def remove_client(self, callback):
++        if callback in self._clients:
++            self._clients.remove(callback)
++        if not self._clients:
++            self.stop_reporting()
++
++    # ---- G-Code Commands ----
++
++    def cmd_dump(self, gcmd):
++        e = gcmd.get_int('E', 0, minval=0, maxval=1)
++        t = gcmd.get_float('T', 1.0, minval=0.1, maxval=1.0)
++        s = gcmd.get_int('S', SELF_CHECK_STATE, minval=SELF_CHECK_STATE, maxval=HEAD_BLOCK_STATE)
++        # map thresholds
++        sensitivity_map = {
++            SELF_CHECK_STATE:     self.self_check_sensitivity,
++            SCRATCH_STATE:        self.scratch_sensitivity,
++            BLOCK_FILAMENT_STATE: self.block_filament_sensitivity,
++            HEAD_BLOCK_STATE:     self.head_block_sensitivity
++        }
++        sens = sensitivity_map.get(s, self.sensitivity)
++
++        if e:
++           # Tell the host proxy to start reports
++            self._enable_cs1237(1)
++            self.start_reporting()
++           # Then instruct MCU to report cs1237_state every T seconds
++            self._check_start(t, s, sens, 0)
++        else:
++           # First tell MCU to stop cs1237_state messages
++            self._check_stop(s)
++           # Then tell the host proxy to stop reporting
++            self.stop_reporting()
++            self._enable_cs1237(0)
++
++    def cmd_g9121(self, gcmd):
++        e = gcmd.get_int('E', 0, minval=0, maxval=1)
++        r = gcmd.get_int('R', 0, minval=0, maxval=1)
++        self._reporting = r > 0
++        t = gcmd.get_float('T', 1.0, minval=0.1, maxval=1.0)
++        
++        if e:
++            self._check_start(t, SCRATCH_STATE, self.scratch_sensitivity, 0)
++        else:
++            self._check_stop(SCRATCH_STATE)
++    
++    def cmd_g9122(self, gcmd):
++        e = gcmd.get_int('E', 0, minval=0, maxval=1)
++        r = gcmd.get_int('R', 0, minval=0, maxval=1)
++        self._reporting = r > 0
++        t = gcmd.get_float('T', 1.0, minval=0.1, maxval=1.0)
++        
++        if e:
++            self._check_start(t, SELF_CHECK_STATE, self.self_check_sensitivity, 0)
++        else:
++            self._check_stop(SELF_CHECK_STATE)
++
++    def cmd_g9123(self, gcmd):
++        reactor = self.printer.get_reactor()
++        params = None
++        try:
++            w = gcmd.get_int('W', 0, minval=0, maxval=3)
++            self._query_complete = reactor.completion()
++            self.cmd_checkself.send([self._oid, w])
++
++            params = self._query_complete.wait(reactor.monotonic() + 2.0)
++            if params:
++                self.checkself_flag = int(params.get('flag', 0))
++                gcode = self.printer.lookup_object('gcode')
++                gcode.respond_info(f"NozzleTestFlag:{self.checkself_flag}")
++        finally:
++            self._query_complete = None
++
++
++    # ---- Internal Helpers ----
++    def _check_start(self, check_period, check_type, sensitivity, delay_send_time=0):
++        ticks = self.mcu.seconds_to_clock(check_period)
++        delay_t = self.mcu.seconds_to_clock(delay_send_time) if delay_send_time else 0
++        
++        self.cmd_start_report.send([
++            self._oid,
++            1,
++            ticks,
++            check_type,
++            sensitivity
++        ], minclock=delay_t)
++
++    def _check_stop(self, check_type):
++        self.cmd_start_report.send([
++            self._oid,
++            0,
++            0,
++            check_type,
++            0
++        ])
++
++    # ---- Startup Self-Check ----
++    def _self_check_sequence(self, _args):
++        # Reset before self-check
++        self._cmd_reset.send([self._oid, 3])
++        
++        # Small delay after reset
++        self.printer.get_reactor().pause(
++            self.printer.get_reactor().monotonic() + 0.1
++        )
++        
++        self._check_start(1.0, SELF_CHECK_STATE, self.self_check_sensitivity, 0)
++        
++        self._self_check_resonances()
++        
++        # Wait for moves to complete
++        toolhead = self.printer.lookup_object('toolhead')
++        toolhead.wait_moves()
++        
++        # Pause for 3 seconds to collect data
++        self.printer.get_reactor().pause(
++            self.printer.get_reactor().monotonic() + 3.0
++        )
++        
++        # Stop the check
++        self._check_stop(SELF_CHECK_STATE)
++        
++        # Check result and raise error if needed
++        if self.sensor_state == SELF_CHECK_ERR:
++            raise Exception("CS1237 boot up self-check failed")
++
++    def _self_check_resonances(self):
++        try:
++            gcode = self.printer.lookup_object('gcode')
++            toolhead = self.printer.lookup_object('toolhead')
++            pos = toolhead.get_position()
++            
++            cmd = f"SPECIALIZED_TEST_RESONANCES axis=x FREQ_START=45 FREQ_END=55 HZ_PER_SEC=10 POINT={pos[0]},{pos[1]},{pos[2]}"
++            gcode.run_script_from_command(cmd)
++        except Exception:
++            logging.exception("CS1237: Error running resonance test")
++
++def load_config(config):
++    return CS1237(config)
+diff --git a/klippy/extras/lis2dw12.py b/klippy/extras/lis2dw12.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..571b206ad8e45f02f98e378f3dbac257a78d2013
+--- /dev/null
++++ b/klippy/extras/lis2dw12.py
+@@ -0,0 +1,335 @@
++# Support for reading acceleration data from an LIS2DW12 chip
++#
++# Copyright (C) 2025 Antiriad <mail.antiriad@gmail.com>
++#
++# This file may be distributed under the terms of the GNU GPLv3 license.
++
++import logging
++from . import bus, bulk_sensor, adxl345
++
++# LIS2DW12 registers and constants
++LIS2DW12_REGISTERS = {
++    "REG_DEVID": 0x0F,
++    "REG_CTRL1": 0x20,
++    "REG_CTRL6": 0x25,
++    "REG_FIFO_CTRL": 0x2E,
++    "REG_MOD_READ": 0x80,
++}
++
++LIS2DW12_INFO = {
++    "DEV_ID": 0x44,
++    "POWER_OFF": 0x00,
++    "SET_CTRL1_MODE": 0x04,
++    "SET_FIFO_CTL": 0xC0,
++    "SET_CTRL6_ODR_FS": 0x04,
++    "FREEFALL_ACCEL": 9.80665 * 1000.,
++    "SCALE_XY": 0.000244140625 * 9.80665 * 1000,
++    "SCALE_Z": 0.000244140625 * 9.80665 * 1000,
++}
++
++LIS2DW12_QUERY_RATES = {
++    25: 0x3, 50: 0x4, 100: 0x5, 200: 0x6, 400: 0x7, 800: 0x8, 1600: 0x9,
++}
++
++BYTES_PER_SAMPLE = 6
++SAMPLES_PER_BLOCK = 8
++MIN_MSG_TIME = 0.100
++
++
++class LIS2DW12:
++    def __init__(self, config):
++        self.printer = config.get_printer()
++        adxl345.AccelCommandHelper(config, self)
++
++        logging.info(
++            "LIS2DW12: Initializing section '%s'", config.get_name()
++        )
++        logging.info(
++            "LIS2DW12: axes_map=%s, rate=%s",
++            config.get("axes_map", "x,y,z"),
++            config.get("rate", 1600),
++        )
++
++        # Axes map and scaling
++        am = {
++            "x": (0, LIS2DW12_INFO["SCALE_XY"]),
++            "y": (1, LIS2DW12_INFO["SCALE_XY"]),
++            "z": (2, LIS2DW12_INFO["SCALE_Z"]),
++            "-x": (0, -LIS2DW12_INFO["SCALE_XY"]),
++            "-y": (1, -LIS2DW12_INFO["SCALE_XY"]),
++            "-z": (2, -LIS2DW12_INFO["SCALE_Z"]),
++        }
++        axes_map = config.getlist("axes_map", ["x", "y", "z"], ',', count=3)
++        self.axes_map = [am[str(a).strip()] for a in axes_map]
++
++        self.data_rate = config.getint("rate", 1600)
++        if self.data_rate not in LIS2DW12_QUERY_RATES:
++            raise config.error("Invalid lis2dw12 rate parameter")
++
++        # Setup SPI bus
++        self.bus = bus.MCU_SPI_from_config(config, 3, default_speed=5000000)
++        self.mcu = self.bus.get_mcu()
++        self.oid = self.mcu.create_oid()
++        self.last_sequence = 0
++        self.max_query_duration = 1 << 31
++
++        # MCU commands
++        config_cmd = (
++            f"config_lis2dw12 oid={self.oid} spi_oid={self.bus.get_oid()}"
++        )
++        self.mcu.add_config_cmd(config_cmd)
++        rest_ticks = self.mcu.seconds_to_clock(4.0 / self.data_rate)
++        query_cmd = (
++            f"query_lis2dw12 oid={self.oid} clock=0 rest_ticks={rest_ticks}"
++        )
++        self.mcu.add_config_cmd(query_cmd, on_restart=True)
++        self.mcu.register_config_callback(self._build_config)
++        self.mcu.register_response(
++            self._handle_lis2dw12_data, "lis2dw12_data", self.oid
++        )
++        self.mcu.register_response(
++            self._handle_lis2dw12_status, "lis2dw12_status", self.oid
++        )
++
++        # Batch/bulk sensor setup
++        self.samples = []
++        self.last_error_count = 0
++        self.last_limit_count = 0
++        self.name = config.get_name().split()[-1]
++        BATCH_UPDATES = 0.100
++        self.batch_bulk = bulk_sensor.BatchBulkHelper(
++            self.printer,
++            self._process_batch,
++            self._start_measurements,
++            self._finish_measurements,
++            BATCH_UPDATES,
++        )
++        hdr = ("time", "x_acceleration", "y_acceleration", "z_acceleration")
++        self.batch_bulk.add_mux_endpoint(
++            "lis2dw12/dump_lis2dw12", "sensor", self.name, {"header": hdr}
++        )
++        self.clock_sync = bulk_sensor.ClockSyncRegression(self.mcu, 640)
++
++    def _build_config(self):
++        cmdqueue = self.bus.get_command_queue()
++        self.query_sensor_cmd = self.mcu.lookup_command(
++            "query_lis2dw12 oid=%c clock=%u rest_ticks=%u", cq=cmdqueue
++        )
++        self.query_sensor_status_cmd = self.mcu.lookup_query_command(
++            "query_lis2dw12_status oid=%c",
++            "lis2dw12_status oid=%c clock=%u query_ticks=%u next_sequence=%hu"
++            " buffered=%c fifo=%c limit_count=%hu",
++            self.oid,
++            cmdqueue,
++        )
++
++    def start_internal_client(self):
++        aqh = adxl345.AccelQueryHelper(self.printer)
++        self.batch_bulk.add_client(aqh.handle_batch)
++        return aqh
++
++    def _handle_lis2dw12_data(self, params):
++        self.samples.append(params)
++
++    def _handle_lis2dw12_status(self, params):
++        self.last_error_count = params.get("errors", self.last_error_count)
++        self.last_limit_count = params.get("limit_count", self.last_limit_count)
++
++    def _process_batch(self, eventtime):
++        self._update_clock()
++        raw_samples = self.samples
++        self.samples = []
++        if not raw_samples:
++            # No data available, return empty dict (like adxl345)
++            return {}
++        try:
++            samples = self.extract_samples(raw_samples)
++        except Exception:
++            samples = []
++        return {
++            "data": samples,
++            "errors": self.last_error_count,
++            "overflows": self.last_limit_count,
++        }
++
++    def _start_measurements(self):
++        dev_id = self.read_reg(LIS2DW12_REGISTERS["REG_DEVID"])
++        if dev_id != LIS2DW12_INFO["DEV_ID"]:
++            raise self.printer.command_error(
++                "Invalid lis2dw12 id (got %x vs %x)"
++                % (dev_id, LIS2DW12_INFO["DEV_ID"])
++            )
++
++        ctrl1_val = (
++            LIS2DW12_QUERY_RATES[self.data_rate] << 4
++            | LIS2DW12_INFO["SET_CTRL1_MODE"]
++        )
++        self.set_reg(LIS2DW12_REGISTERS["REG_CTRL1"], ctrl1_val)
++        self.set_reg(
++            LIS2DW12_REGISTERS["REG_FIFO_CTRL"], LIS2DW12_INFO["POWER_OFF"]
++        )
++        self.set_reg(
++            LIS2DW12_REGISTERS["REG_CTRL6"], LIS2DW12_INFO["SET_CTRL6_ODR_FS"]
++        )
++        self.set_reg(
++            LIS2DW12_REGISTERS["REG_FIFO_CTRL"], LIS2DW12_INFO["SET_FIFO_CTL"]
++        )
++
++        # Start bulk reading
++        systime = self.printer.get_reactor().monotonic()
++        print_time = self.mcu.estimated_print_time(systime) + MIN_MSG_TIME
++        reqclock = self.mcu.print_time_to_clock(print_time)
++        rest_ticks = self.mcu.seconds_to_clock(4.0 / self.data_rate)
++        self.query_sensor_cmd.send([self.oid, reqclock, rest_ticks])
++
++        # Reset & cleanup state here
++        self.samples = []
++        self.last_sequence = 0
++        self.last_error_count = 0
++        self.last_limit_count = 0
++        self.max_query_duration = 1 << 31
++        if hasattr(self.clock_sync, "reset"):
++            self.clock_sync.reset(float(reqclock), 0.0)
++
++    def _finish_measurements(self):
++        self.set_reg(LIS2DW12_REGISTERS["REG_FIFO_CTRL"], 0x00)
++        self.query_sensor_cmd.send_wait_ack([self.oid, 0, 0])
++        self.set_reg(LIS2DW12_REGISTERS["REG_FIFO_CTRL"], 0x00)
++
++    def read_reg(self, reg):
++        params = self.bus.spi_transfer(
++            [reg | LIS2DW12_REGISTERS["REG_MOD_READ"], 0x00]
++        )
++        response = bytearray(params["response"])
++        return response[1]
++
++    def set_reg(self, reg, val, minclock=0):
++        self.bus.spi_send([reg, val & 0xFF], minclock=minclock)
++        stored_val = self.read_reg(reg)
++        if stored_val != val:
++            raise self.printer.command_error(
++                "Failed to set LIS2DW12 register [0x%x] to 0x%x: got 0x%x."
++                % (reg, val, stored_val)
++            )
++
++    def extract_samples(self, raw_samples):
++        x_pos, x_scale = self.axes_map[0]
++        y_pos, y_scale = self.axes_map[1]
++        z_pos, z_scale = self.axes_map[2]
++
++        try:
++            time_base, chip_base, inv_freq = self.clock_sync.get_time_translation()
++        except ZeroDivisionError:
++            raise self.printer.command_error(
++                "LIS2DW12: Clock synchronization not ready. "
++                "Not enough data for timing translation. "
++                "Wait for more samples or check sensor connection."
++            )
++
++        count = 0
++        samples = [None] * (len(raw_samples) * SAMPLES_PER_BLOCK)
++
++        for params in raw_samples:
++            seq_diff = (self.last_sequence - params.get("sequence", 0)) & 0xFFFF
++            seq_diff -= (seq_diff & 0x8000) << 1
++            seq = self.last_sequence - seq_diff
++            d = params.get("data", b"")
++
++            msg_cdiff = float(seq) * float(SAMPLES_PER_BLOCK) - chip_base
++
++            for i in range(0, len(d), BYTES_PER_SAMPLE):
++                if i + BYTES_PER_SAMPLE > len(d):
++                    break
++
++                xlow = d[i] & 0xFC  # Mask bottom 2 bits
++                ylow = d[i + 1] & 0xFC
++                zlow = d[i + 2] & 0xFC
++                xhigh = d[i + 3] & 0xFF
++                yhigh = d[i + 4] & 0xFF
++                zhigh = d[i + 5] & 0xFF
++
++                rx = xlow | (xhigh << 8)
++                ry = ylow | (yhigh << 8)
++                rz = zlow | (zhigh << 8)
++
++                # Convert to signed 16-bit
++                rx = rx if rx < 0x8000 else rx - 0x10000
++                ry = ry if ry < 0x8000 else ry - 0x10000
++                rz = rz if rz < 0x8000 else rz - 0x10000
++
++                raw_xyz = [rx, ry, rz]
++
++                # Apply axes mapping and scaling
++                x = raw_xyz[int(x_pos)] * x_scale / 4.0
++                y = raw_xyz[int(y_pos)] * y_scale / 4.0
++                z = raw_xyz[int(z_pos)] * z_scale / 4.0
++
++                # Sample index within this message
++                sample_offset = float(i // BYTES_PER_SAMPLE)
++                ptime = time_base + (msg_cdiff + sample_offset) * inv_freq
++
++                samples[count] = (ptime, x, y, z)
++                count += 1
++
++        del samples[count:]
++        return samples
++
++    def _update_clock(self, minclock=0):
++        # Query with retry logic
++        for retry in range(5):
++            try:
++                params = self.query_sensor_status_cmd.send([self.oid], minclock)
++                fifo = params.get("fifo", 0) & 0x7F
++                if fifo <= 32:
++                    break
++            except Exception as e:
++                if retry == 4:
++                    raise self.printer.command_error(
++                        "Unable to query lis2dw12 fifo: %s" % str(e)
++                    )
++                continue
++
++        # Update sequence tracking
++        mcu_clock = self.mcu.clock32_to_clock64(params["clock"])
++        sequence = (self.last_sequence & (~0xFFFF)) | params["next_sequence"]
++        if sequence < self.last_sequence:
++            sequence += 0x10000
++        self.last_sequence = sequence
++
++        # Update limit count tracking
++        buffered = params.get("buffered", 0)
++        limit_count = ((self.last_limit_count & (~0xFFFF)) | params["limit_count"])
++        if limit_count < self.last_limit_count:
++            limit_count += 0x10000
++        self.last_limit_count = limit_count
++
++        # Duration-based filtering
++        duration = params["query_ticks"]
++        if duration > self.max_query_duration:
++            self.max_query_duration = max(
++                2 * self.max_query_duration, self.mcu.seconds_to_clock(0.000005)
++            )
++            return
++
++        self.max_query_duration = 2 * duration
++
++        msg_count = (
++            sequence * SAMPLES_PER_BLOCK
++            + buffered // BYTES_PER_SAMPLE
++            + fifo
++        )
++        chip_clock = float(msg_count + 1)  # +1 for timing offset like Go
++
++        self.clock_sync.update(float(mcu_clock + duration // 2), chip_clock)
++
++        # Set last chip clock for timing continuity
++        if hasattr(self.clock_sync, "set_last_chip_clock"):
++            self.clock_sync.set_last_chip_clock(chip_clock)
++
++
++def load_config(config):
++    return LIS2DW12(config)
++
++
++def load_config_prefix(config):
++    return LIS2DW12(config)
+diff --git a/klippy/extras/probe_ks1.py b/klippy/extras/probe_ks1.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..170d14a9150a2a0e3cb837f3149bcfa5a31ee14b
+--- /dev/null
++++ b/klippy/extras/probe_ks1.py
+@@ -0,0 +1,149 @@
++# KS1 Custom Probe support (utilizing Klipper probe helpers)
++#
++# Copyright (C) 2025 Antiriad <mail.antiriad@gmail.com>
++#
++# This file may be distributed under the terms of the GNU GPLv3 license.
++
++import logging
++from . import probe
++
++class ProbeKS1:
++    def __init__(self, config):
++        self.printer = config.get_printer()
++        self.name = config.get_name()
++        
++        self.speed = config.getfloat("speed", 5.0, above=0.0)
++        self.lift_speed = config.getfloat("lift_speed", self.speed, above=0.0)
++        self.x_offset = config.getfloat("x_offset", 0.0)
++        self.y_offset = config.getfloat("y_offset", 0.0)
++        self.z_offset = config.getfloat("z_offset", 0.0)
++
++        # Currently not used/supported settings from printer.cfg
++        # As this module uses probehelper for probing and not the manual aproach in this module
++        # this settings are currently without any effect. They are left active here, so that
++        # its still possible to load a standard KS1 probe config without getting klipper complaining
++        # about this unused keys. 
++        self.z_offset = config.getfloat("z_offset", 0.0)
++        self.final_speed = config.getfloat("final_speed", 2.0, above=0.0)
++
++        # Z position inference
++        if config.has_section("stepper_z"):
++            zconfig = config.getsection("stepper_z")
++            self.z_position = zconfig.getfloat("position_min", 0.0)
++        else:
++            pconfig = config.getsection("printer")
++            self.z_position = pconfig.getfloat("minimum_z_position", 0.0)
++        
++        self.z_position = config.getfloat("z_position", self.z_position)
++
++
++        # CS1237 strain gauge sensor reference
++        # Currently not used, as it enables itself and start reporting as soon as klippy connects
++        #self.cs1237 = self.printer.lookup_object('cs1237')
++        
++
++        # Standard Klipper probe endstop (MCU handles triggering)
++        self.mcu_endstop = probe.ProbeEndstopWrapper(config)
++
++        # Standard probe methods
++        self.get_mcu = self.mcu_endstop.get_mcu
++        self.add_stepper = self.mcu_endstop.add_stepper
++        self.get_steppers = self.mcu_endstop.get_steppers
++        self.home_start = self.mcu_endstop.home_start
++        self.home_wait = self.mcu_endstop.home_wait
++        
++        # Use MCU triggering
++        self.query_endstop = self.mcu_endstop.query_endstop
++
++        # Standard Klipper probe helpers
++        self.cmd_helper = probe.ProbeCommandHelper(config, self, self.query_endstop)
++        self.probe_offsets = probe.ProbeOffsetsHelper(config)
++        self.param_helper = probe.ProbeParameterHelper(config)
++        self.homing_helper = probe.HomingViaProbeHelper(config, self, self.param_helper)
++        
++        self.probe_session = probe.ProbeSessionHelper(
++            config, self.param_helper, self.homing_helper.start_probe_session)
++        
++        # Register as the printer's probe object,so probe_k1 gets registred as standard probe
++        config.get_printer().add_object('probe', self)
++        
++           
++    # Interface for ProbeCommandHelper
++    def get_probe_params(self, gcmd=None):
++        return self.param_helper.get_probe_params(gcmd)
++
++    def get_offsets(self):
++        return self.probe_offsets.get_offsets()
++
++    def get_status(self, eventtime):
++        return self.cmd_helper.get_status(eventtime)
++
++    def start_probe_session(self, gcmd):
++        return self.probe_session.start_probe_session(gcmd)
++
++    def get_position_endstop(self):
++        return self.z_offset
++
++    def get_lift_speed(self, gcmd=None):
++        if gcmd is not None:
++            return gcmd.get_float("LIFT_SPEED", self.lift_speed, above=0.0)
++        return self.lift_speed
++
++    # Probe lifecycle methods
++    def probe_prepare(self, hmove):
++        """Ensure endstop isn't already triggered before probing."""
++        toolhead = self.printer.lookup_object("toolhead")
++        reactor = self.printer.get_reactor()
++
++        # Ask MCU slightly IN THE FUTURE to avoid stale/latched state
++        def _is_endstop_active():
++            pt = toolhead.get_last_move_time() + 0.050  # 50 ms in the future
++            try:
++                return bool(self.mcu_endstop.query_endstop(pt))
++            except Exception:
++                return False
++
++        # Debounced check: read twice with a short gap
++        pre_trig_1 = _is_endstop_active()
++        if pre_trig_1:
++            reactor.pause(reactor.monotonic() + 0.030)  # 30 ms settle
++            pre_trig_2 = _is_endstop_active()
++        else:
++            pre_trig_2 = False
++
++        if pre_trig_1 and pre_trig_2:
++            logging.warning("ProbeKS1: endstop TRIGGERED before move; lifting 2mm to clear")
++            cur = toolhead.get_position()
++            toolhead.manual_move([cur[0], cur[1], cur[2] + 2.0], self.get_lift_speed(None))
++            toolhead.wait_moves()
++            # Re-check once more after lift
++            if _is_endstop_active():
++                raise self.printer.command_error(
++                    "ProbeKS1: Endstop still triggered before probing after 2mm lift "
++                )
++
++        # Delegate to standard probe preparation
++        self.mcu_endstop.probe_prepare(hmove)
++
++    def probe_finish(self, hmove):
++        self.mcu_endstop.probe_finish(hmove)
++
++    def multi_probe_begin(self):
++        self.mcu_endstop.multi_probe_begin()
++
++    def multi_probe_end(self):
++        self.mcu_endstop.multi_probe_end()
++
++    def raise_probe(self):
++        # No-op for strain gauge probe (always active)
++        pass
++
++    def lower_probe(self):
++        # No-op for strain gauge probe (always active)
++        pass
++
++    def move(self, coord, speed):
++        self.printer.lookup_object("toolhead").manual_move(coord, speed)
++
++def load_config(config):
++    return ProbeKS1(config)
+diff --git a/klippy/extras/temperature_sensors.cfg b/klippy/extras/temperature_sensors.cfg
+index 4fbe5492c709076e12faa8eee1f49435399cbe18..186e540862e17afdd0339afe6cc7b6806e6c6820 100644
+--- a/klippy/extras/temperature_sensors.cfg
++++ b/klippy/extras/temperature_sensors.cfg
+@@ -109,3 +109,14 @@ beta: 3974
+ temperature1: 25
+ resistance1: 100000
+ beta: 4100
++
++# Definition inherent from name. This sensor is deprecated!
++[thermistor NTC 100K beta 3950]
++temperature1: 25
++resistance1: 100000
++beta: 3950
++
++[thermistor NTC ZM3486 HNS112HC4570G0060Y3486]
++temperature1: 200
++resistance1: 1104
++beta: 4570

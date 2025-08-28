@@ -15,8 +15,10 @@ if [ ! -f $CONFIG_DESTINATION ]; then
     cp $CONFIG_SOURCE $CONFIG_DESTINATION
 fi
 
+cp mainsail.cfg /userdata/app/gk/printer_data/config/
+
 # Start Klippy
 cd klippy
-python -m klippy -a /tmp/unix_uds1 $CONFIG_DESTINATION >> $RINKHALS_ROOT/logs/app-klippy.log 2>&1 &
+nice -n -20 python -m klippy -a /tmp/unix_uds1 $CONFIG_DESTINATION >> /tmp/klippy.log 2>&1 &
 
 assert_by_name klippy

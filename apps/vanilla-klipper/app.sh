@@ -12,36 +12,54 @@ status() {
     fi
 }
 
-start() {
-    stop
-    cd $APP_ROOT
+reset_mcus() {
+    if [ "$KOBRA_MODEL_CODE" = "KS1" ]; then
+        echo 116 > /sys/class/gpio/export 2>/dev/null
+        echo out > /sys/class/gpio/gpio116/direction 2>/dev/null
+        echo 0 > /sys/class/gpio/gpio116/value 2>/dev/null
+        sleep 1
+        echo 1 > /sys/class/gpio/gpio116/value 2>/dev/null
+    else
+        echo "MCU reset not implemented"
+    fi
 
+}
+
+start() {
+    #Stop klippy in case it's running
+    kill_by_name klippy
     # Stop gklib
     kill_by_name gklib
 
+    reset_mcus
+
     # Start Klippy
+    cd $APP_ROOT
     chmod +x klippy.sh
     ./klippy.sh &
 }
 
 debug() {
-    stop
-    cd $APP_ROOT
-
+    kill_by_name klippy
     kill_by_name gklib
+    reset_mcus
 
+    cd $APP_ROOT
     # Create Python venv
     python -m venv --without-pip $APP_ROOT
     . bin/activate
 
     # Start OctoApp
     cd klippy
-    python -m klippy -a /tmp/unix_uds1 $@
+    python -m klippy -a /tmp/unix_uds1  /userdata/app/gk/printer_data/config/printer.klipper.cfg >> /tmp/klippy.log 2>&1 &
 }
 
 stop() {
     kill_by_name klippy
     
+    #MCU reset to allow gklib MCU configuration
+    reset_mcus
+
     cd /userdata/app/gk
 
     LD_LIBRARY_PATH=/userdata/app/gk:$LD_LIBRARY_PATH \

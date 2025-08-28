@@ -45,7 +45,7 @@ class IdleTimeout:
         self.state = "Printing"
         try:
             script = self.idle_gcode.render()
-            res = self.gcode.run_script(script)
+            self.gcode.run_script(script)
         except:
             logging.exception("idle timeout gcode execution")
             self.state = "Ready"
@@ -71,6 +71,8 @@ class IdleTimeout:
         # Idle timeout has elapsed
         return self.transition_idle_state(eventtime)
     def timeout_handler(self, eventtime):
+        if self.printer.is_shutdown():
+            return self.reactor.NEVER
         if self.state == "Ready":
             return self.check_idle_timeout(eventtime)
         # Check if need to transition to "ready" state

@@ -46,7 +46,7 @@ class TemperatureFan:
             self.cmd_SET_TEMPERATURE_FAN_TARGET,
             desc=self.cmd_SET_TEMPERATURE_FAN_TARGET_help)
 
-    def set_speed(self, read_time, value):
+    def set_tf_speed(self, read_time, value):
         if value <= 0.:
             value = 0.
         elif value < self.min_speed:
@@ -60,7 +60,7 @@ class TemperatureFan:
         speed_time = read_time + self.speed_delay
         self.next_speed_time = speed_time + 0.75 * MAX_FAN_TIME
         self.last_speed_value = value
-        self.fan.set_speed(speed_time, value)
+        self.fan.set_speed(value, speed_time)
     def temperature_callback(self, read_time, temp):
         self.last_temp = temp
         self.control.temperature_callback(read_time, temp)
@@ -72,7 +72,7 @@ class TemperatureFan:
         return self.max_speed
     def get_status(self, eventtime):
         status = self.fan.get_status(eventtime)
-        status["temperature"] = self.last_temp
+        status["temperature"] = round(self.last_temp, 2)
         status["target"] = self.target_temp
         return status
     cmd_SET_TEMPERATURE_FAN_TARGET_help = \
@@ -128,10 +128,10 @@ class ControlBangBang:
               and temp <= target_temp-self.max_delta):
             self.heating = True
         if self.heating:
-            self.temperature_fan.set_speed(read_time, 0.)
+            self.temperature_fan.set_tf_speed(read_time, 0.)
         else:
-            self.temperature_fan.set_speed(read_time,
-                                           self.temperature_fan.get_max_speed())
+            self.temperature_fan.set_tf_speed(
+                read_time, self.temperature_fan.get_max_speed())
 
 ######################################################################
 # Proportional Integral Derivative (PID) control algo
@@ -147,9 +147,9 @@ class ControlPID:
         self.Ki = config.getfloat('pid_Ki') / PID_PARAM_BASE
         self.Kd = config.getfloat('pid_Kd') / PID_PARAM_BASE
         self.min_deriv_time = config.getfloat('pid_deriv_time', 2., above=0.)
-        imax = config.getfloat('pid_integral_max',
-                               self.temperature_fan.get_max_speed(), minval=0.)
-        self.temp_integ_max = imax / self.Ki
+        self.temp_integ_max = 0.
+        if self.Ki:
+            self.temp_integ_max = self.temperature_fan.get_max_speed() / self.Ki
         self.prev_temp = AMBIENT_TEMP
         self.prev_temp_time = 0.
         self.prev_temp_deriv = 0.
@@ -171,7 +171,7 @@ class ControlPID:
         # Calculate output
         co = self.Kp*temp_err + self.Ki*temp_integ - self.Kd*temp_deriv
         bounded_co = max(0., min(self.temperature_fan.get_max_speed(), co))
-        self.temperature_fan.set_speed(
+        self.temperature_fan.set_tf_speed(
             read_time, max(self.temperature_fan.get_min_speed(),
                            self.temperature_fan.get_max_speed() - bounded_co))
         # Store state for next measurement

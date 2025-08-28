@@ -1,6 +1,6 @@
 # Parse gcode commands
 #
-# Copyright (C) 2016-2021  Kevin O'Connor <kevin@koconnor.net>
+# Copyright (C) 2016-2024  Kevin O'Connor <kevin@koconnor.net>
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import os, re, logging, collections, shlex
@@ -26,6 +26,20 @@ class GCodeCommand:
         return self._commandline
     def get_command_parameters(self):
         return self._params
+    def get_raw_command_parameters(self):
+        command = self._command
+        origline = self._commandline
+        param_start = len(command)
+        param_end = len(origline)
+        if origline[:param_start].upper() != command:
+            # Skip any gcode line-number and ignore any trailing checksum
+            param_start += origline.upper().find(command)
+            end = origline.rfind('*')
+            if end >= 0 and origline[end+1:].isdigit():
+                param_end = end
+        if origline[param_start:param_start+1].isspace():
+            param_start += 1
+        return origline[param_start:param_end]
     def ack(self, msg=None):
         if not self._need_ack:
             return False
@@ -89,6 +103,7 @@ class GCodeDispatch:
         self.ready_gcode_handlers = {}
         self.mux_commands = {}
         self.gcode_help = {}
+        self.status_commands = {}
         # Register commands needed before config file is loaded
         handlers = ['M110', 'M112', 'M115',
                     'RESTART', 'FIRMWARE_RESTART', 'ECHO', 'STATUS', 'HELP']
@@ -111,11 +126,16 @@ class GCodeDispatch:
                 del self.ready_gcode_handlers[cmd]
             if cmd in self.base_gcode_handlers:
                 del self.base_gcode_handlers[cmd]
+            self._build_status_commands()
             return old_cmd
         if cmd in self.ready_gcode_handlers:
             raise self.printer.config_error(
                 "gcode command %s already registered" % (cmd,))
         if not self.is_traditional_gcode(cmd):
+            if (cmd.upper() != cmd or not cmd.replace('_', 'A').isalnum()
+                or cmd[0].isdigit() or cmd[1:2].isdigit()):
+                raise self.printer.config_error(
+                    "Can't register '%s' as it is an invalid name" % (cmd,))
             origfunc = func
             func = lambda params: origfunc(self._get_extended_params(params))
         self.ready_gcode_handlers[cmd] = func
@@ -123,10 +143,12 @@ class GCodeDispatch:
             self.base_gcode_handlers[cmd] = func
         if desc is not None:
             self.gcode_help[cmd] = desc
+        self._build_status_commands()
     def register_mux_command(self, cmd, key, value, func, desc=None):
         prev = self.mux_commands.get(cmd)
         if prev is None:
-            self.register_command(cmd, self._cmd_mux, desc=desc)
+            handler = lambda gcmd: self._cmd_mux(cmd, gcmd)
+            self.register_command(cmd, handler, desc=desc)
             self.mux_commands[cmd] = prev = (key, {})
         prev_key, prev_values = prev
         if prev_key != key:
@@ -140,6 +162,14 @@ class GCodeDispatch:
         prev_values[value] = func
     def get_command_help(self):
         return dict(self.gcode_help)
+    def get_status(self, eventtime):
+        return {'commands': self.status_commands}
+    def _build_status_commands(self):
+        commands = {cmd: {} for cmd in self.gcode_handlers}
+        for cmd in self.gcode_help:
+            if cmd in commands:
+                commands[cmd]['help'] = self.gcode_help[cmd]
+        self.status_commands = commands
     def register_output_handler(self, cb):
         self.output_callbacks.append(cb)
     def _handle_shutdown(self):
@@ -147,15 +177,17 @@ class GCodeDispatch:
             return
         self.is_printer_ready = False
         self.gcode_handlers = self.base_gcode_handlers
+        self._build_status_commands()
         self._respond_state("Shutdown")
     def _handle_disconnect(self):
         self._respond_state("Disconnect")
     def _handle_ready(self):
         self.is_printer_ready = True
         self.gcode_handlers = self.ready_gcode_handlers
+        self._build_status_commands()
         self._respond_state("Ready")
     # Parse input into commands
-    args_r = re.compile('([A-Z_]+|[A-Z*/])')
+    args_r = re.compile('([A-Z_]+|[A-Z*])')
     def _process_commands(self, commands, need_ack=True):
         for line in commands:
             # Ignore comments and leading/trailing spaces
@@ -165,16 +197,14 @@ class GCodeDispatch:
                 line = line[:cpos]
             # Break line into parts and determine command
             parts = self.args_r.split(line.upper())
-            numparts = len(parts)
-            cmd = ""
-            if numparts >= 3 and parts[1] != 'N':
-                cmd = parts[1] + parts[2].strip()
-            elif numparts >= 5 and parts[1] == 'N':
+            if ''.join(parts[:2]) == 'N':
                 # Skip line number at start of command
-                cmd = parts[3] + parts[4].strip()
+                cmd = ''.join(parts[3:5]).strip()
+            else:
+                cmd = ''.join(parts[:3]).strip()
             # Build gcode "params" dictionary
             params = { parts[i]: parts[i+1].strip()
-                       for i in range(1, numparts, 2) }
+                       for i in range(1, len(parts), 2) }
             gcmd = GCodeCommand(self, cmd, origline, params, need_ack)
             # Invoke handler for command
             handler = self.gcode_handlers.get(cmd, self.cmd_default)
@@ -222,26 +252,22 @@ class GCodeDispatch:
     def _respond_state(self, state):
         self.respond_info("Klipper state: %s" % (state,), log=False)
     # Parameter parsing helpers
-    extended_r = re.compile(
-        r'^\s*(?:N[0-9]+\s*)?'
-        r'(?P<cmd>[a-zA-Z_][a-zA-Z0-9_]+)(?:\s+|$)'
-        r'(?P<args>[^#*;]*?)'
-        r'\s*(?:[#*;].*)?$')
     def _get_extended_params(self, gcmd):
-        m = self.extended_r.match(gcmd.get_commandline())
-        if m is None:
-            raise self.error("Malformed command '%s'"
-                             % (gcmd.get_commandline(),))
-        eargs = m.group('args')
+        rawparams = gcmd.get_raw_command_parameters()
+        # Extract args while allowing shell style quoting
+        s = shlex.shlex(rawparams, posix=True)
+        s.whitespace_split = True
+        s.commenters = '#;'
         try:
-            eparams = [earg.split('=', 1) for earg in shlex.split(eargs)]
+            eparams = [earg.split('=', 1) for earg in s]
             eparams = { k.upper(): v for k, v in eparams }
-            gcmd._params.clear()
-            gcmd._params.update(eparams)
-            return gcmd
         except ValueError as e:
             raise self.error("Malformed command '%s'"
                              % (gcmd.get_commandline(),))
+        # Update gcmd with new parameters
+        gcmd._params.clear()
+        gcmd._params.update(eparams)
+        return gcmd
     # G-Code special command handlers
     def cmd_default(self, gcmd):
         cmd = gcmd.get_command()
@@ -260,12 +286,15 @@ class GCodeDispatch:
             if cmdline:
                 logging.debug(cmdline)
             return
-        if cmd.startswith("M117 "):
-            # Handle M117 gcode with numeric and special characters
-            handler = self.gcode_handlers.get("M117", None)
-            if handler is not None:
-                handler(gcmd)
-                return
+        if ' ' in cmd:
+            # Handle M117/M118 gcode with numeric and special characters
+            realcmd = cmd.split()[0]
+            if realcmd in ["M117", "M118", "M23"]:
+                handler = self.gcode_handlers.get(realcmd, None)
+                if handler is not None:
+                    gcmd._command = realcmd
+                    handler(gcmd)
+                    return
         elif cmd in ['M140', 'M104'] and not gcmd.get_float('S', 0.):
             # Don't warn about requests to turn off heaters when not present
             return
@@ -274,8 +303,8 @@ class GCodeDispatch:
             # Don't warn about requests to turn off fan when fan not present
             return
         gcmd.respond_info('Unknown command:"%s"' % (cmd,))
-    def _cmd_mux(self, gcmd):
-        key, values = self.mux_commands[gcmd.get_command()]
+    def _cmd_mux(self, command, gcmd):
+        key, values = self.mux_commands[command]
         if None in values:
             key_param = gcmd.get(key, None)
         else:
@@ -377,12 +406,12 @@ class GCodeIO:
         self._dump_debug()
         if self.is_fileinput:
             self.printer.request_exit('error_exit')
-    m112_r = re.compile('^(?:[nN][0-9]+)?\s*[mM]112(?:\s|$)')
+    m112_r = re.compile(r'^(?:[nN][0-9]+)?\s*[mM]112(?:\s|$)')
     def _process_data(self, eventtime):
         # Read input, separate by newline, and add to pending_commands
         try:
-            data = os.read(self.fd, 4096)
-        except os.error:
+            data = str(os.read(self.fd, 4096).decode())
+        except (os.error, UnicodeDecodeError):
             logging.exception("Read g-code")
             return
         self.input_log.append((eventtime, data))
@@ -427,7 +456,7 @@ class GCodeIO:
     def _respond_raw(self, msg):
         if self.pipe_is_active:
             try:
-                os.write(self.fd, msg+"\n")
+                os.write(self.fd, (msg+"\n").encode())
             except os.error:
                 logging.exception("Write g-code response")
                 self.pipe_is_active = False

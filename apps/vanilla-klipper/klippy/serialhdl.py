@@ -12,7 +12,6 @@ class error(Exception):
     pass
 
 class SerialReader:
-    BITS_PER_BYTE = 10.
     def __init__(self, reactor, warn_prefix=""):
         self.reactor = reactor
         self.warn_prefix = warn_prefix
@@ -62,7 +61,7 @@ class SerialReader:
         raise error(self.warn_prefix + (msg % params))
     def _get_identify_data(self, eventtime):
         # Query the "data dictionary" from the micro-controller
-        identify_data = ""
+        identify_data = b""
         while 1:
             msg = "identify offset=%d count=%d" % (len(identify_data), 40)
             try:
@@ -77,7 +76,7 @@ class SerialReader:
                     # Done
                     return identify_data
                 identify_data += msgdata
-    def _start_session(self, serial_dev, serial_fd_type='u', client_id=0):
+    def _start_session(self, serial_dev, serial_fd_type=b'u', client_id=0):
         self.serial_dev = serial_dev
         self.serialqueue = self.ffi_main.gc(
             self.ffi_lib.serialqueue_alloc(serial_dev.fileno(),
@@ -97,11 +96,13 @@ class SerialReader:
         self.msgparser = msgparser
         self.register_response(self.handle_unknown, '#unknown')
         # Setup baud adjust
-        mcu_baud = msgparser.get_constant_float('SERIAL_BAUD', None)
-        if mcu_baud is not None:
-            baud_adjust = self.BITS_PER_BYTE / mcu_baud
-            self.ffi_lib.serialqueue_set_baud_adjust(
-                self.serialqueue, baud_adjust)
+        if serial_fd_type == b'c':
+            wire_freq = msgparser.get_constant_float('CANBUS_FREQUENCY', None)
+        else:
+            wire_freq = msgparser.get_constant_float('SERIAL_BAUD', None)
+        if wire_freq is not None:
+            self.ffi_lib.serialqueue_set_wire_frequency(self.serialqueue,
+                                                        wire_freq)
         receive_window = msgparser.get_constant_int('RECEIVE_WINDOW', None)
         if receive_window is not None:
             self.ffi_lib.serialqueue_set_receive_window(
@@ -135,13 +136,13 @@ class SerialReader:
                                         can_filters=filters,
                                         bustype='socketcan')
                 bus.send(set_id_msg)
-            except can.CanError as e:
-                logging.warn("%sUnable to open CAN port: %s",
-                             self.warn_prefix, e)
+            except (can.CanError, os.error, IOError) as e:
+                logging.warning("%sUnable to open CAN port: %s",
+                                self.warn_prefix, e)
                 self.reactor.pause(self.reactor.monotonic() + 5.)
                 continue
             bus.close = bus.shutdown # XXX
-            ret = self._start_session(bus, 'c', txid)
+            ret = self._start_session(bus, b'c', txid)
             if not ret:
                 continue
             # Verify correct canbus_nodeid to canbus_uuid mapping
@@ -165,7 +166,8 @@ class SerialReader:
             try:
                 fd = os.open(filename, os.O_RDWR | os.O_NOCTTY)
             except OSError as e:
-                logging.warn("%sUnable to open port: %s", self.warn_prefix, e)
+                logging.warning("%sUnable to open port: %s",
+                                self.warn_prefix, e)
                 self.reactor.pause(self.reactor.monotonic() + 5.)
                 continue
             serial_dev = os.fdopen(fd, 'rb+', 0)
@@ -186,7 +188,7 @@ class SerialReader:
                 serial_dev.rts = rts
                 serial_dev.open()
             except (OSError, IOError, serial.SerialException) as e:
-                logging.warn("%sUnable to open serial port: %s",
+                logging.warning("%sUnable to open serial port: %s",
                              self.warn_prefix, e)
                 self.reactor.pause(self.reactor.monotonic() + 5.)
                 continue
@@ -198,7 +200,7 @@ class SerialReader:
         self.serial_dev = debugoutput
         self.msgparser.process_identify(dictionary, decompress=False)
         self.serialqueue = self.ffi_main.gc(
-            self.ffi_lib.serialqueue_alloc(self.serial_dev.fileno(), 'f', 0),
+            self.ffi_lib.serialqueue_alloc(self.serial_dev.fileno(), b'f', 0),
             self.ffi_lib.serialqueue_free)
     def set_clock_est(self, freq, conv_time, conv_clock, last_clock):
         self.ffi_lib.serialqueue_set_clock_est(
@@ -218,13 +220,15 @@ class SerialReader:
     def stats(self, eventtime):
         if self.serialqueue is None:
             return ""
-        self.ffi_lib.serialqueue_get_stats(
-            self.serialqueue, self.stats_buf, len(self.stats_buf))
-        return self.ffi_main.string(self.stats_buf)
+        self.ffi_lib.serialqueue_get_stats(self.serialqueue,
+                                           self.stats_buf, len(self.stats_buf))
+        return str(self.ffi_main.string(self.stats_buf).decode())
     def get_reactor(self):
         return self.reactor
     def get_msgparser(self):
         return self.msgparser
+    def get_serialqueue(self):
+        return self.serialqueue
     def get_default_command_queue(self):
         return self.default_cmd_queue
     # Serial response callbacks
@@ -288,13 +292,13 @@ class SerialReader:
         logging.debug("%sUnknown message %d (len %d) while identifying",
                       self.warn_prefix, params['#msgid'], len(params['#msg']))
     def handle_unknown(self, params):
-        logging.warn("%sUnknown message type %d: %s",
+        logging.warning("%sUnknown message type %d: %s",
                      self.warn_prefix, params['#msgid'], repr(params['#msg']))
     def handle_output(self, params):
         logging.info("%s%s: %s", self.warn_prefix,
                      params['#name'], params['#msg'])
     def handle_default(self, params):
-        logging.warn("%sgot %s", self.warn_prefix, params)
+        logging.warning("%sgot %s", self.warn_prefix, params)
 
 # Class to send a query command and return the received response
 class SerialRetryCommand:
@@ -338,7 +342,7 @@ def stk500v2_leave(ser, reactor):
     ser.baudrate = 115200
     reactor.pause(reactor.monotonic() + 0.100)
     ser.read(4096)
-    ser.write('\x1b\x01\x00\x01\x0e\x11\x04')
+    ser.write(b'\x1b\x01\x00\x01\x0e\x11\x04')
     reactor.pause(reactor.monotonic() + 0.050)
     res = ser.read(4096)
     logging.debug("Got %s from stk500v2", repr(res))

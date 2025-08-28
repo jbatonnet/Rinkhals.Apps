@@ -1,6 +1,6 @@
 # Protocol definitions for firmware communication
 #
-# Copyright (C) 2016-2021  Kevin O'Connor <kevin@koconnor.net>
+# Copyright (C) 2016-2024  Kevin O'Connor <kevin@koconnor.net>
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import json, zlib, logging
@@ -21,7 +21,7 @@ MESSAGE_TRAILER_SYNC = 1
 MESSAGE_PAYLOAD_MAX = MESSAGE_MAX - MESSAGE_MIN
 MESSAGE_SEQ_MASK = 0x0f
 MESSAGE_DEST = 0x10
-MESSAGE_SYNC = '\x7E'
+MESSAGE_SYNC = 0x7e
 
 class error(Exception):
     pass
@@ -29,12 +29,10 @@ class error(Exception):
 def crc16_ccitt(buf):
     crc = 0xffff
     for data in buf:
-        data = ord(data)
         data ^= crc & 0xff
         data ^= (data & 0x0f) << 4
         crc = ((data << 8) | (crc >> 8)) ^ (data >> 4) ^ (data << 3)
-    crc = chr(crc >> 8) + chr(crc & 0xff)
-    return crc
+    return [crc >> 8, crc & 0xff]
 
 class PT_uint32:
     is_int = True
@@ -162,8 +160,8 @@ def convert_msg_format(msgformat):
     return msgformat
 
 class MessageFormat:
-    def __init__(self, msgid, msgformat, enumerations={}):
-        self.msgid = msgid
+    def __init__(self, msgid_bytes, msgformat, enumerations={}):
+        self.msgid_bytes = msgid_bytes
         self.msgformat = msgformat
         self.debugformat = convert_msg_format(msgformat)
         self.name = msgformat.split()[0]
@@ -171,19 +169,17 @@ class MessageFormat:
         self.param_types = [t for name, t in self.param_names]
         self.name_to_type = dict(self.param_names)
     def encode(self, params):
-        out = []
-        out.append(self.msgid)
+        out = list(self.msgid_bytes)
         for i, t in enumerate(self.param_types):
             t.encode(out, params[i])
         return out
     def encode_by_name(self, **params):
-        out = []
-        out.append(self.msgid)
+        out = list(self.msgid_bytes)
         for name, t in self.param_names:
             t.encode(out, params[name])
         return out
     def parse(self, s, pos):
-        pos += 1
+        pos += len(self.msgid_bytes)
         out = {}
         for name, t in self.param_names:
             v, pos = t.parse(s, pos)
@@ -200,13 +196,13 @@ class MessageFormat:
 
 class OutputFormat:
     name = '#output'
-    def __init__(self, msgid, msgformat):
-        self.msgid = msgid
+    def __init__(self, msgid_bytes, msgformat):
+        self.msgid_bytes = msgid_bytes
         self.msgformat = msgformat
         self.debugformat = convert_msg_format(msgformat)
         self.param_types = lookup_output_params(msgformat)
     def parse(self, s, pos):
-        pos += 1
+        pos += len(self.msgid_bytes)
         out = []
         for t in self.param_types:
             v, pos = t.parse(s, pos)
@@ -221,7 +217,7 @@ class OutputFormat:
 class UnknownFormat:
     name = '#unknown'
     def parse(self, s, pos):
-        msgid = s[pos]
+        msgid, param_pos = PT_int32().parse(s, pos)
         msg = bytes(bytearray(s))
         return {'#msgid': msgid, '#msg': msg}, len(s)-MESSAGE_TRAILER_SIZE
     def format_params(self, params):
@@ -236,6 +232,8 @@ class MessageParser:
         self.messages = []
         self.messages_by_id = {}
         self.messages_by_name = {}
+        self.msgid_by_format = {}
+        self.msgid_parser = PT_int32()
         self.config = {}
         self.version = self.build_versions = ""
         self.raw_identify_data = ""
@@ -245,10 +243,10 @@ class MessageParser:
     def check_packet(self, s):
         if len(s) < MESSAGE_MIN:
             return 0
-        msglen = ord(s[MESSAGE_POS_LEN])
+        msglen = s[MESSAGE_POS_LEN]
         if msglen < MESSAGE_MIN or msglen > MESSAGE_MAX:
             return -1
-        msgseq = ord(s[MESSAGE_POS_SEQ])
+        msgseq = s[MESSAGE_POS_SEQ]
         if (msgseq & ~MESSAGE_SEQ_MASK) != MESSAGE_DEST:
             return -1
         if len(s) < msglen:
@@ -258,7 +256,7 @@ class MessageParser:
             return -1
         msgcrc = s[msglen-MESSAGE_TRAILER_CRC:msglen-MESSAGE_TRAILER_CRC+2]
         crc = crc16_ccitt(s[:msglen-MESSAGE_TRAILER_SIZE])
-        if crc != msgcrc:
+        if crc != list(msgcrc):
             #logging.debug("got crc %s vs %s", repr(crc), repr(msgcrc))
             return -1
         return msglen
@@ -267,7 +265,7 @@ class MessageParser:
         out = ["seq: %02x" % (msgseq,)]
         pos = MESSAGE_HEADER_SIZE
         while 1:
-            msgid = s[pos]
+            msgid, param_pos = self.msgid_parser.parse(s, pos)
             mid = self.messages_by_id.get(msgid, self.unknown)
             params, pos = mid.parse(s, pos)
             out.append(mid.format_params(params))
@@ -284,20 +282,20 @@ class MessageParser:
             return "%s %s" % (name, msg)
         return str(params)
     def parse(self, s):
-        msgid = s[MESSAGE_HEADER_SIZE]
+        msgid, param_pos = self.msgid_parser.parse(s, MESSAGE_HEADER_SIZE)
         mid = self.messages_by_id.get(msgid, self.unknown)
         params, pos = mid.parse(s, MESSAGE_HEADER_SIZE)
         if pos != len(s)-MESSAGE_TRAILER_SIZE:
             self._error("Extra data at end of message")
         params['#name'] = mid.name
         return params
-    def encode(self, seq, cmd):
+    def encode_msgblock(self, seq, cmd):
         msglen = MESSAGE_MIN + len(cmd)
         seq = (seq & MESSAGE_SEQ_MASK) | MESSAGE_DEST
-        out = [chr(msglen), chr(seq), cmd]
-        out.append(crc16_ccitt(''.join(out)))
+        out = [msglen, seq] + cmd
+        out.append(crc16_ccitt(out))
         out.append(MESSAGE_SYNC)
-        return ''.join(out)
+        return out
     def _parse_buffer(self, value):
         if not value:
             return []
@@ -318,10 +316,15 @@ class MessageParser:
             self._error("Command format mismatch: %s vs %s",
                         msgformat, mp.msgformat)
         return mp
+    def lookup_msgid(self, msgformat):
+        msgid = self.msgid_by_format.get(msgformat)
+        if msgid is None:
+            self._error("Unknown command: %s", msgformat)
+        return msgid
     def create_command(self, msg):
         parts = msg.strip().split()
         if not parts:
-            return ""
+            return []
         msgname = parts[0]
         mp = self.messages_by_name.get(msgname)
         if mp is None:
@@ -368,21 +371,22 @@ class MessageParser:
                 start_value, count = value
                 for i in range(count):
                     enums[enum_root + str(start_enum + i)] = start_value + i
-    def _init_messages(self, messages, command_tags=[], output_tags=[]):
-        for msgformat, msgtag in messages.items():
+    def _init_messages(self, messages, command_ids=[], output_ids=[]):
+        for msgformat, msgid in messages.items():
             msgtype = 'response'
-            if msgtag in command_tags:
+            if msgid in command_ids:
                 msgtype = 'command'
-            elif msgtag in output_tags:
+            elif msgid in output_ids:
                 msgtype = 'output'
-            self.messages.append((msgtag, msgtype, msgformat))
-            if msgtag < -32 or msgtag > 95:
-                self._error("Multi-byte msgtag not supported")
-            msgid = msgtag & 0x7f
+            self.messages.append((msgid, msgtype, msgformat))
+            self.msgid_by_format[msgformat] = msgid
+            msgid_bytes = []
+            self.msgid_parser.encode(msgid_bytes, msgid)
             if msgtype == 'output':
-                self.messages_by_id[msgid] = OutputFormat(msgid, msgformat)
+                self.messages_by_id[msgid] = OutputFormat(msgid_bytes,
+                                                          msgformat)
             else:
-                msg = MessageFormat(msgid, msgformat, self.enumerations)
+                msg = MessageFormat(msgid_bytes, msgformat, self.enumerations)
                 self.messages_by_id[msgid] = msg
                 self.messages_by_name[msg.name] = msg
     def process_identify(self, data, decompress=True):
