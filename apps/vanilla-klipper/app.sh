@@ -14,6 +14,7 @@ status() {
 
 reset_mcus() {
     if [ "$KOBRA_MODEL_CODE" = "KS1" ]; then
+        echo "KS1: Reseting MCU(s)"
         echo 116 > /sys/class/gpio/export 2>/dev/null
         echo out > /sys/class/gpio/gpio116/direction 2>/dev/null
         echo 0 > /sys/class/gpio/gpio116/value 2>/dev/null
@@ -22,7 +23,6 @@ reset_mcus() {
     else
         echo "MCU reset not implemented"
     fi
-
 }
 
 start() {
