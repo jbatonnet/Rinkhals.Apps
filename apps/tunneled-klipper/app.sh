@@ -35,18 +35,20 @@ start() {
       fi
     fi
 
-    local delay=10
+    local delay=15
     local until_ts=$(( $(date +%s) + delay ))
     echo "$until_ts" > "$WAIT_UNTIL_FILE"
 
     setsid nohup bash -c "
       sleep $delay
+       ./pwm_jingle.sh indy
       \"$ORIG_SCRIPT\" start || true
       rm -f \"$WAIT_PID_FILE\" \"$WAIT_UNTIL_FILE\" 2>/dev/null || true
     " >/dev/null 2>&1 &
 
     echo $! > "$WAIT_PID_FILE"
     echo "Delayed start scheduled in ${delay}s (launcher PID $(cat "$WAIT_PID_FILE"))."
+    ./pwm_jingle.sh ta-da
     # Return immediately while the detached launcher sleeps.
     return 0
   fi

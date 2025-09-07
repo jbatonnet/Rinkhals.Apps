@@ -1,0 +1,7 @@
+{
+    "$version": "1",
+
+    "name": "tunneled-klipper",
+    "description": "Tunnels the MCU serial ports via socat",
+    "version": "0.1"
+}
