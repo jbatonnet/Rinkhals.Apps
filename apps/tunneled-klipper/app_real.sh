@@ -50,7 +50,7 @@ get_by_pidfile() {
 reset_mcus() {
     case "${KOBRA_MODEL_CODE:-}" in
         KS1)
-            echo 116 > /sys/class/gpio/export
+            echo 116 > /sys/class/gpio/export 2>/dev/null || true
             echo out > /sys/class/gpio/gpio116/direction
             echo 0 > /sys/class/gpio/gpio116/value
             sleep 1

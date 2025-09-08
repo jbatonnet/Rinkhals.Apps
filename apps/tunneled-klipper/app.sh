@@ -1,5 +1,5 @@
 # app.sh launchwrapper
-# A thin wrapper that defers start() by 10s when invoked by a parent "./start.sh"
+# A thin wrapper that defers start() by model depended time when invoked by a parent "./start.sh"
 # and returns immediately, while still exposing start/stop/status/debug entrypoints.
 
 source /useremain/rinkhals/.current/tools.sh
@@ -17,12 +17,27 @@ mkdir -p "$STATE_DIR" 2>/dev/null || true
 parent_cmdline() {
   tr '\0' ' ' < "/proc/$PPID/cmdline" | sed 's/[[:space:]]*$//'
 }
+START_DELAY=0
+model_setup() {
+    case "${KOBRA_MODEL_CODE:-}" in
+        KS1)
+            START_DELAY=15
+            ;;
+        K3)
+            START_DELAY=15
+            ;;
+        ""|*)
+            START_DELAY=0
+            ;;
+    esac
+}
 
 start() {
   local parent
   parent="$(parent_cmdline)"
+  model_setup
 
-  if [[ "$parent" == *"./start.sh"* ]]; then
+  if [[ "$parent" == *"./start.sh"* ]] && [ "$START_DELAY" -gt 0 ]; then
     # If there is already a waiting launcher, just report and return
     if [[ -f "$WAIT_PID_FILE" ]]; then
       local wpid
@@ -35,13 +50,13 @@ start() {
       fi
     fi
 
-    local delay=15
+    local delay=$START_DELAY
     local until_ts=$(( $(date +%s) + delay ))
     echo "$until_ts" > "$WAIT_UNTIL_FILE"
 
     setsid nohup bash -c "
       sleep $delay
-       ./pwm_jingle.sh indy
+       ./pwm_jingle.sh ok
       \"$ORIG_SCRIPT\" start || true
       rm -f \"$WAIT_PID_FILE\" \"$WAIT_UNTIL_FILE\" 2>/dev/null || true
     " >/dev/null 2>&1 &
@@ -54,6 +69,7 @@ start() {
   fi
 
   # Otherwise, call through immediately
+  ./pwm_jingle.sh ok
   "$ORIG_SCRIPT" start
 }
 
@@ -91,6 +107,7 @@ stop() {
   fi
 
   "$ORIG_SCRIPT" stop
+  ./pwm_jingle.sh sad
 }
 
 debug() {
@@ -107,3 +124,4 @@ case "${1:-}" in
     exit 1
     ;;
 esac
+
