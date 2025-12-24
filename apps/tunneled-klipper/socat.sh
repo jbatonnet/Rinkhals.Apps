@@ -156,6 +156,9 @@ export APP_ROOT=$(dirname $(realpath $0))
     SRC_DEV="$(resolve_src "$SRC")"
     echo "[$(date +%F_%T)] Using SRC=$SRC_DEV, DST=$DST; starting socat." >&2
 
+    #Flush MCU serial port
+    stty -F ${DST} sane
+
     # Start socat and record PID
     nice -n -20 socat -d -d \
       "OPEN:${SRC_DEV},raw,echo=0" \

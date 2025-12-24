@@ -15,9 +15,13 @@ model_setup() {
             SERIAL_MCU="/dev/ttyS3"
             SERIAL_NOZZLE_MCU="/dev/ttyS0"
             ;;
+        K2P)
+            SERIAL_MCU="/dev/ttyS3"
+            SERIAL_NOZZLE_MCU=""
+            ;;
         ""|*)
             echo "Error: Unknown or empty KOBRA_MODEL_CODE='${KOBRA_MODEL_CODE:-}'."
-            echo "Supported: KS1, K3. Export KOBRA_MODEL_CODE and try again."
+            echo "Supported: KS1, K3, K2P. Export KOBRA_MODEL_CODE and try again."
             return 1
             ;;
     esac
@@ -59,6 +63,9 @@ reset_mcus() {
         K3)
             echo "Note: reset_mcus() not implemented for model K3; skipping." >&2
             ;;
+        K2P)
+            echo "Note: reset_mcus() not applicable for K2P; skipping." >&2
+            ;;
         *)
             echo "Note: reset_mcus() skipped due to unknown KOBRA_MODEL_CODE." >&2
             ;;
@@ -69,14 +76,12 @@ status() {
     # Model-aware PIDs if we can resolve; otherwise fall back to scanning known patterns
     PIDS=""
     if model_setup 2>/dev/null; then
-        for f in \
-            "$(pidfile_for_socat "$SERIAL_MCU")" \
-            "$(pidfile_for_socat "$SERIAL_NOZZLE_MCU")" \
-            "$(pidfile_for_launcher "$SERIAL_MCU")" \
-            "$(pidfile_for_launcher "$SERIAL_NOZZLE_MCU")"
-        do
-            pid="$(get_by_pidfile "$f")" || continue
-            PIDS="${PIDS}${PIDS:+ }$pid"
+        for dev in "$SERIAL_MCU" "$SERIAL_NOZZLE_MCU"; do
+            [ -n "$dev" ] || continue
+            for f in "$(pidfile_for_socat "$dev")" "$(pidfile_for_launcher "$dev")"; do
+                pid="$(get_by_pidfile "$f")" || continue
+                PIDS="${PIDS}${PIDS:+ }$pid"
+            done
         done
     else
         # Fallback: scan any ttyS* PID files so 'status' still works without a model set
@@ -108,6 +113,7 @@ start() {
 
     # Stop previous socat/launcher instances for our selected ports by PID file
     for dev in "$SERIAL_MCU" "$SERIAL_NOZZLE_MCU"; do
+        [ -n "$dev" ] || continue
         for pidfile in "$(pidfile_for_socat "$dev")" "$(pidfile_for_launcher "$dev")"; do
             if [ -r "$pidfile" ]; then
                 pid="$(cat "$pidfile" 2>/dev/null || true)"
@@ -132,7 +138,9 @@ start() {
 
     # Waits for RPI gadget, starts the socat tunnels (model-aware)
     ./socat.sh auto-if=1.0 "$SERIAL_MCU"
-    ./socat.sh auto-if=1.2 "$SERIAL_NOZZLE_MCU"
+    if [ -n "$SERIAL_NOZZLE_MCU" ]; then
+        ./socat.sh auto-if=1.2 "$SERIAL_NOZZLE_MCU"
+    fi
     # ./socat_ace.sh auto-if=1.4 ace=0
 
     # Allow full MCU (re)configuration
@@ -143,6 +151,7 @@ stop() {
     # Best-effort: if model is known, target our ports; otherwise fall back to generic sweep
     if model_setup 2>/dev/null; then
         for dev in "$SERIAL_MCU" "$SERIAL_NOZZLE_MCU"; do
+            [ -n "$dev" ] || continue
             for pidfile in "$(pidfile_for_socat "$dev")" "$(pidfile_for_launcher "$dev")"; do
                 if [ -r "$pidfile" ]; then
                     kill "$(cat "$pidfile")" 2>/dev/null || true
