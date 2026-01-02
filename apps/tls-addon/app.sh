@@ -1,12 +1,16 @@
 APP_ROOT="$(dirname $(realpath $0))"
 
-CRT="${CRT:-/useremain/home/rinkhals/printer_data/certs/moonraker.cert}"
-KEY="${KEY:-/useremain/home/rinkhals/printer_data/certs/moonraker.key}"
-
-PID_FILE="/tmp/rinkhals/tls-addon.pids"
+STUNNEL_CONF="/tmp/rinkhals/stunnel.conf"
+PID_FILE=
+KEY=
+CRT=
 
 init() {
   source /useremain/rinkhals/.current/tools.sh
+
+  PID_FILE="$(get_config_value pid)"
+  KEY="$(get_config_value key)"
+  CRT="$(get_config_value cert)"
 }
 
 main() {
@@ -39,7 +43,7 @@ help() {
 
 status() {
   if [[ -f "$PID_FILE" ]]; then
-    report_status $APP_STATUS_STARTED "$(cat "$PID_FILE" | xargs)"
+    report_status $APP_STATUS_STARTED "$(cat "$PID_FILE")"
     return
   fi
 
@@ -50,45 +54,32 @@ start() {
   stop
 
   crt_key_exist || create_crt_key
-
-  while read -r service listen target; do
-    [[ -z "$service" ]] && continue             # skip empty lines
-    case "$service" in \#*) continue ;; esac    # skip commented lines
-
-    echo "Mapping service $service: $listen(https) -> $target(http)" >&2
-    local pid
-
-    pid="$(add_mapping $listen $target)"
-    [[ "$?" == 0 ]] && echo "$pid" >> "$PID_FILE"
-  done < "$APP_ROOT/port_mappings.conf"
+  stunnel "$STUNNEL_CONF"
 }
 
 stop() {
   [[ -f "$PID_FILE" ]] || return
 
-  while read pid; do
-    kill_by_id "$pid"
-  done < "$PID_FILE"
+  local pid=$(cat "$PID_FILE")
+  kill_by_id "$pid"
 
   rm "$PID_FILE"
 }
 
-add_mapping() {
-  local listen target pid
+get_config_value() {
+  local conf="$1"
+  local key="$2"
 
-  listen="$1"
-  target="$2"
-
-  echo socat "OPENSSL-LISTEN:$listen,cert=$CRT,key=$KEY,verify=0,reuseaddr,fork TCP:127.0.0.1:$target" 1> /dev/null &
-  pid=$!
-
-  if [[ "$?" == 0 ]]; then
-    echo $pid
-    return 0
-  else
-    echo 0
-    return 1
-  fi
+  awk -v key="$key" -F'=' '
+  BEGIN{ORS=""};                      # do not print additional LF
+  {
+      gsub(/[ \t\r\n]/, "", $1);      # remove spaces/tabs/CR/LF from key
+      if ($1 == key) {                # check if cleaned key matches
+          gsub(/[ \t\r\n]/, "", $2);  # remove spaces/tabs/CR/LF from value
+          print $2;
+          exit;                       # stop once found
+      }
+  }' "$conf"
 }
 
 create_crt_key() {

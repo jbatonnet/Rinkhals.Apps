@@ -1,7 +1,7 @@
 # TLS for Rinkhals
 
 This adds HTTPS endpoints multiple HTTP services of rinkhals. For which ports are mapped and used, please consult
-[port_mappings.conf](./port_mappings.conf). It uses self-signed certificated which get created on the fly if necessary.
+[stunnel.conf](./stunnel.conf). It uses self-signed certificated which get created on the fly if necessary.
 See [rinkhals_ssl.conf](./rinkhals_ssl.conf) for details. 
 
 > **NOTE:** If one is browsing the HTTPS endpoints the browser will most likely show a warning. It should be read 
