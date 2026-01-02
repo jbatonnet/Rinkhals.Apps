@@ -8,9 +8,9 @@ CRT=
 init() {
   source /useremain/rinkhals/.current/tools.sh
 
-  PID_FILE="$(get_config_value pid)"
-  KEY="$(get_config_value key)"
-  CRT="$(get_config_value cert)"
+  PID_FILE="$(get_config_value "$STUNNEL_CONF" pid)"
+  KEY="$(get_config_value "$STUNNEL_CONF" key)"
+  CRT="$(get_config_value "$STUNNEL_CONF" cert)"
 }
 
 main() {
@@ -52,7 +52,6 @@ status() {
 
 start() {
   stop
-
   crt_key_exist || create_crt_key
   stunnel "$STUNNEL_CONF"
 }
@@ -84,6 +83,8 @@ get_config_value() {
 
 create_crt_key() {
   openssl req -x509 -nodes -days 3650 -newkey rsa:4096 -keyout "$KEY" -out "$CRT" -config "$APP_ROOT/rinkhals_ssl.conf"
+  chmod u=rw,g=,o= "$KEY"
+  chmod u=rw,g=r,o=r "$CRT"
 }
 
 crt_key_exist() {
