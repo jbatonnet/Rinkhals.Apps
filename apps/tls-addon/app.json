@@ -1,0 +1,7 @@
+{
+    "$version": "1",
+
+    "name": "TLS add-on for other services",
+    "description": "Adds TLS for existing services with self-signed SSL certificates.",
+    "version": "1.0.0"
+}
