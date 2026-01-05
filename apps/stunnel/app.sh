@@ -1,6 +1,6 @@
 APP_ROOT="$(dirname $(realpath $0))"
 
-STUNNEL_CONF="/tmp/rinkhals/stunnel.conf"
+STUNNEL_CONF="$APP_ROOT/stunnel.conf"
 PID_FILE=
 KEY=
 CRT=
