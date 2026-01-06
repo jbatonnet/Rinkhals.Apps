@@ -30,6 +30,15 @@ fi
 
 echo "Preparing update package for $APP..."
 
+# Run get-*.sh scripts if present (to download dependencies for moonraker-obico or octoapp)
+for GET_SCRIPT in $APP_ROOT/get-*.sh; do
+    if [ -f "$GET_SCRIPT" ]; then
+        echo "Running $(basename $GET_SCRIPT)..."
+        chmod +x "$GET_SCRIPT"
+        OBICO_DIRECTORY="$APP_ROOT" "$GET_SCRIPT" || echo "WARNING: $(basename $GET_SCRIPT) failed"
+    fi
+done
+
 mkdir -p /tmp/update_swu/$APP
 cp -r $APP_ROOT/* /tmp/update_swu/$APP/
 

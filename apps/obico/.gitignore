@@ -1,0 +1,10 @@
+# Downloaded during build
+moonraker-obico/
+lib/
+
+# Created during install/runtime
+.installed
+bin/
+include/
+pyvenv.cfg
+

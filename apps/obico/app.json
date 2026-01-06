@@ -1,0 +1,28 @@
+{
+    "$version": "1",
+    "name": "Obico",
+    "description": "AI-Powered Failure Detection and Remote Monitoring for Klipper",
+    "version": "fae2c90",
+    "requirements": {
+        "cpu": 10,
+        "memory": 50
+    },
+    "properties": {
+        "is_linked": {
+            "display": "Status",
+            "type": "report",
+            "default": "Unknown"
+        },
+        "link_code": {
+            "display": "Link Code",
+            "type": "report",
+            "default": "-"
+        },
+        "relink": {
+            "display": "Relink (restart required)",
+            "type": "enum",
+            "options": ["No", "Yes"],
+            "default": "No"
+        }
+    }
+}
