@@ -1,0 +1,52 @@
+{
+    "$version": "1",
+    "name": "NUT-Client",
+    "description": "Client for Network UPS Tools (NUT) to monitor UPS device connected to the printer",
+    "version": "0.1",
+    "depends": [],
+    "requirements":{
+        "cpu": 5,
+        "memory": 20
+    },
+    "properties": {
+        "nut_address": {
+            "display": "NUT server",
+            "type": "text",
+            "default": ""
+        },
+        "nut_port": {
+            "display": "Port",
+            "type": "number",
+            "range": [
+                1024,
+                65536
+            ],
+            "default": 3493
+        },
+        "nut_user": {
+            "display": "Username",
+            "type": "text",
+            "default": ""
+        },
+        "nut_password": {
+            "display": "Password",
+            "type": "text",
+            "default": ""
+        },
+        "ups_name": {
+            "display": "UPS name",
+            "type": "text",
+            "default": ""
+        },
+        "ups_status": {
+            "display": "UPS Status",
+            "type": "report",
+            "default": ""
+        },
+        "battery_charge": {
+            "display": "Battery charge",
+            "type": "report",
+            "default": ""
+        }
+    }
+}
