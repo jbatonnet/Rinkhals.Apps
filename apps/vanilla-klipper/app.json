@@ -2,6 +2,6 @@
     "$version": "1",
 
     "name": "Klipper (vanilla)",
-    "description": "Vanilla Klipper to replace Anycubic GoKlipper reimplementation",
-    "version": "0.1"
+    "description": "Vanilla Klipper to replace Anycubic GoKlipper reimplementation (with ACE support)",
+    "version": "0.2"
 }

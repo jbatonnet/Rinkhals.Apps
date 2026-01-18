@@ -21,6 +21,9 @@ cp -p /work/klipper/*/scripts/klippy-requirements.txt /apps/vanilla-klipper/
 cd /apps/vanilla-klipper
 patch -p0 < klippy.patch
 
+#Add driver for ACE Pro andvirtual_pins module
+patch -p0 < ACEProDriver.patch
+
 # Replace probe related code with newer version from klipper master, needed for kobra-s1
 # This workaround can be removed when klipper > 0.13.0 is released and used here.
 patch -p1 < v013_probe_update.patch

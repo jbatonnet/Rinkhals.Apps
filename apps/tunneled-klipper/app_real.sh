@@ -19,9 +19,13 @@ model_setup() {
             SERIAL_MCU="/dev/ttyS3"
             SERIAL_NOZZLE_MCU=""
             ;;
+        K3V2)
+            SERIAL_MCU="/dev/ttyS3"
+            SERIAL_NOZZLE_MCU="/dev/ttyS0"
+            ;;            
         ""|*)
             echo "Error: Unknown or empty KOBRA_MODEL_CODE='${KOBRA_MODEL_CODE:-}'."
-            echo "Supported: KS1, K3, K2P. Export KOBRA_MODEL_CODE and try again."
+            echo "Supported: KS1, K3, K3V2, K2P. Export KOBRA_MODEL_CODE and try again."
             return 1
             ;;
     esac
@@ -63,6 +67,9 @@ reset_mcus() {
         K3)
             echo "Note: reset_mcus() not implemented for model K3; skipping." >&2
             ;;
+        K3V2)
+            echo "Note: reset_mcus() not implemented for model K3V2; skipping." >&2
+            ;;            
         K2P)
             echo "Note: reset_mcus() not applicable for K2P; skipping." >&2
             ;;

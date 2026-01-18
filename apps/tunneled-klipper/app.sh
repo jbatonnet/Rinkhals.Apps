@@ -26,9 +26,12 @@ model_setup() {
         K3)
             START_DELAY=15
             ;;
-        K2P)
+        K3V2)
             START_DELAY=15
             ;;
+        K2P)
+            START_DELAY=15
+            ;;            
         ""|*)
             START_DELAY=0
             ;;
