@@ -111,14 +111,12 @@ status() {
 }
 
 start() {
-    # Require a supported model (do nothing if unknown)
     if ! model_setup; then
         exit 1
     fi
 
     cd "$APP_ROOT" || exit 1
 
-    # Stop previous socat/launcher instances for our selected ports by PID file
     for dev in "$SERIAL_MCU" "$SERIAL_NOZZLE_MCU"; do
         [ -n "$dev" ] || continue
         for pidfile in "$(pidfile_for_socat "$dev")" "$(pidfile_for_launcher "$dev")"; do
@@ -132,27 +130,34 @@ start() {
         done
     done
 
-    # Legacy cleanup: ACE launchers if present
     for f in /tmp/socat-ace*-launcher.pid; do
         [ -f "$f" ] && kill "$(cat "$f")" 2>/dev/null || true
         [ -f "$f" ] && rm -f "$f"
     done
 
-    # Stop gklib
     kill_by_name gklib
 
     chmod +x socat.sh 2>/dev/null || true
-
-    # Waits for RPI gadget, starts the socat tunnels (model-aware)
     ./socat.sh auto-if=1.0 "$SERIAL_MCU"
     if [ -n "$SERIAL_NOZZLE_MCU" ]; then
         ./socat.sh auto-if=1.2 "$SERIAL_NOZZLE_MCU"
     fi
-    # ./socat_ace.sh auto-if=1.4 ace=0
 
-    # Allow full MCU (re)configuration
     reset_mcus
+
+    case "${KOBRA_MODEL_CODE:-}" in
+        KS1)
+            # Ensure gkapi path is ORIGINAL (no overlay) while fake server is used
+            export USE_MUTABLE_CONFIG=1
+            export LD_LIBRARY_PATH=/userdata/app/gk:${LD_LIBRARY_PATH:-}
+            /useremain/home/rinkhals/apps/tunneled-klipper/gkapi_patched_run.sh ensure-original || true
+
+            killall -q gkapi 2>/dev/null || true
+            nohup python3 /useremain/home/rinkhals/apps/tunneled-klipper/fake_gkapi_server.py > /tmp/fake_gkapi.log 2>&1 &
+            ;;
+    esac
 }
+
 
 stop() {
     # Best-effort: if model is known, target our ports; otherwise fall back to generic sweep
@@ -183,13 +188,39 @@ stop() {
     done
 
     reset_mcus
+    export LD_LIBRARY_PATH=/userdata/app/gk:${LD_LIBRARY_PATH:-}
 
+    case "${KOBRA_MODEL_CODE:-}" in
+        KS1)
+            # --- Kill fake gkapi server ---
+            for pid in $(ps | grep 'python3 /useremain/home/rinkhals/apps/tunneled-klipp' | grep -v grep | awk '{print $1}'); do
+                kill -9 "$pid" 2>/dev/null || true
+            done
+
+            # --- Start PATCHED gkapi again (power-safe: patched via bind overlay) ---
+            export USE_MUTABLE_CONFIG=1
+
+
+            # Ensure log dir exists (avoid redirection failures)
+            LOG_DIR="${RINKHALS_ROOT:-/tmp}/logs"
+            mkdir -p "$LOG_DIR" 2>/dev/null || true
+
+            # Stop any leftovers before restart
+            killall -q gkapi 2>/dev/null || true
+            killall -q gklib 2>/dev/null || true
+
+            # Build + overlay patched onto canonical path + start
+            /useremain/home/rinkhals/apps/tunneled-klipper/gkapi_patched_run.sh run-patched || true
+            ;;
+    esac
+
+    # Start gklib from vendor working dir as well
     cd /userdata/app/gk || exit 0
-
-    LD_LIBRARY_PATH=/userdata/app/gk:$LD_LIBRARY_PATH \
-        ./gklib -a /tmp/unix_uds1 /userdata/app/gk/printer_data/config/printer.generated.cfg \
-        &> "$RINKHALS_ROOT/logs/gklib.log" &
+    nohup ./gklib -a /tmp/unix_uds1 /userdata/app/gk/printer_data/config/printer.generated.cfg \
+        >> "$LOG_DIR/gklib.log" 2>&1 &
 }
+
+
 
 case "${1:-}" in
     status) status ;;
