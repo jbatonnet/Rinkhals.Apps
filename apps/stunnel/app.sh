@@ -1,6 +1,6 @@
 APP_ROOT="$(dirname $(realpath $0))"
 
-STUNNEL_CONF="/tmp/rinkhals/stunnel.conf"
+STUNNEL_CONF="$APP_ROOT/conf.d/stunnel.conf"
 PID_FILE=
 KEY=
 CRT=
@@ -27,6 +27,9 @@ main() {
     start)
       start
       ;;
+    debug)
+      start debug
+      ;;
     stop)
       stop
       ;;
@@ -38,7 +41,7 @@ main() {
 }
 
 help() {
-  echo "Usage: $0 {status|start|stop}" >&2
+  echo "Usage: $0 {status|start|debug|stop}" >&2
 }
 
 status() {
@@ -51,9 +54,14 @@ status() {
 }
 
 start() {
+  local debug="${1:-}"
   stop
   crt_key_exist || create_crt_key
-  stunnel "$STUNNEL_CONF"
+
+  local config="$APP_ROOT/production.conf"
+  [[ "$debug" == "debug" ]] && config="$APP_ROOT/debug.conf"
+
+  stunnel "$config"
 }
 
 stop() {
